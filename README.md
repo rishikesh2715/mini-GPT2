@@ -1,5 +1,7 @@
 # MINI-GPT2: A Simplified GPT-2 Implementation
 
+!Work in Progress
+
 ## Overview
 This project implements a smaller-scale version of the GPT-2 model from scratch, based on the original GPT-2 paper by OpenAI. The goal is to train the model on the Tiny Shakespeare dataset, a simple text corpus, to generate Shakespeare-like text. The model will have fewer layers, a smaller hidden size, and fewer attention heads compared to the original GPT-2, making it suitable for experimentation on limited compute resources.
 
