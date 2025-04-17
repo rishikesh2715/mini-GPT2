@@ -38,7 +38,7 @@ MINI-GPT2/
 1. **Clone the Repository**  
    ```bash
    git clone https://github.com/rishikesh2715/mini-GPT2.git
-   cd MINI-GPT2
+   cd mini-GPT2
    ```
 
 2. **Set Up a Virtual Environment**  
