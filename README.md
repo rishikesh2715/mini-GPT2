@@ -1,4 +1,4 @@
-# MINI-GPT2: A Simplified GPT-2 Implementation
+# mini-GPT2: A Simplified GPT-2 Implementation
 
 ![Project Status](https://img.shields.io/badge/status-work--in--progress-yellow)
 
