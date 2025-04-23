@@ -1,4 +1,0 @@
-# TODO:
-│       - Define model architecture parameters (e.g., n_layer, n_head, emb_dim)
-│       - Set training hyperparameters (batch size, learning rate, etc.)
-│       - Specify dataset paths, checkpoint paths
