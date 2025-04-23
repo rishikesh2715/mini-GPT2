@@ -1,20 +1,13 @@
-"""
-prepare.py
+# tokenizer.py
+import tiktoken
 
-TODO:
+class GPT2Tokenizer:
+    def __init__(self, model_name="gpt2"):
+        self.encoder = tiktoken.get_encoding(model_name)
 
+    def encode(self, text):
+        return self.encoder.encode(text, allowed_special={"<|endoftext|>"})
 
-Write script to download and prepare the data for training.
-- Download the data from the URL -- https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+    def decode(self, tokens):
+        return self.encoder.decode(tokens)
 
-Reference the code here:
-
-https://github.com/karpathy/nanoGPT/blob/master/data/shakespeare/prepare.py
-
-
-- Implement Byte Pair Encoding (BPE) or character-level tokenizer
-- Build vocabulary and encode tokens
-- Save vocabulary to disk (vocab.json, merges.txt or vocab.pkl)
-- Add helper functions: encode(), decode()
-
-"""
