@@ -9,13 +9,13 @@
 # epochs: 10
 
 
-block_size: 32
+block_size: 128
 vocab_size: 50257  # GPT-2 tokenizer vocab size
-n_layer: 2
-n_head: 2
-n_embd: 64
+n_layer: 6
+n_head: 6
+n_embd: 252
 dropout: 0.1
-batch_size: 2
+batch_size: 32
 learning_rate: 1e-3
-epochs: 1
+epochs: 20
 
