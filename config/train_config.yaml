@@ -1,21 +1,33 @@
 # block_size: 128
-# vocab_size: 50257
+# vocab_size: 50304 
 # n_layer: 4
 # n_head: 4
 # n_embd: 256
-# dropout: 0.1
+# dropout: 0.3
 # batch_size: 32
 # learning_rate: 3e-4
-# epochs: 10
+# min_lr: 1e-5
+# weight_decay: 1e-2
+# warmup_epochs: 5
+# epochs: 2
 
+
+# config/train_config.yaml
 
 block_size: 128
-vocab_size: 50257  # GPT-2 tokenizer vocab size
-n_layer: 6
-n_head: 6
-n_embd: 252
-dropout: 0.1
+vocab_size: 50304
+
+n_layer: 4
+n_head: 4
+n_embd: 256
+dropout: 0.3
+
 batch_size: 32
-learning_rate: 1e-3
+
+learning_rate: 3e-4
+min_lr: 1e-5
+weight_decay: 1e-2
+
+warmup_epochs: 5
 epochs: 20
 
