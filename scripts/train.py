@@ -19,6 +19,9 @@ from utils.plots   import LiveMetricsPlot
 
 # ---- Perf flags ------------------------------------------------------------
 torch.backends.cudnn.benchmark = True        # fastest CUDNN kernels for static shapes
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ============================================================================ #
@@ -33,17 +36,27 @@ class TokenDataset(Dataset):
     """Memory-mapped dataset of uint16-encoded tokens."""
     def __init__(self, path: str, block_size: int):
         data = np.fromfile(path, dtype=np.uint16)
-        self.data        = torch.tensor(data, dtype=torch.long)
-        self.block_size  = block_size
+        self.data       = torch.tensor(data, dtype=torch.long)
+        self.block_size = block_size
 
     def __len__(self) -> int:
+        # keep this the same – it just tells DataLoader how many calls
+        # to __getitem__ to make per epoch
         return len(self.data) - self.block_size
 
-    def __getitem__(self, idx):
+    def __getitem__(self, _):
+        # <- NEW: ignore incoming index and pick a fresh start position
+        idx = torch.randint(
+            0,
+            len(self.data) - self.block_size - 1,
+            (1,)
+        ).item()
+
         chunk = self.data[idx : idx + self.block_size + 1]
         x     = chunk[:-1]
         y     = chunk[1:]
         return x, y
+
 
 
 # ============================================================================ #
@@ -177,7 +190,7 @@ def main(no_plot: bool = False):
     if (
         torch.__version__ >= "2.0.0"
         and DEVICE.type == "cuda"
-        and os.name != "nt"
+        and os.name == "nt"
     ):
         model = torch.compile(model)
 
@@ -221,7 +234,7 @@ def main(no_plot: bool = False):
         print(f"📉 LR → {lr:.2e}")
 
         # pick ~50 points per epoch for plotting
-        log_every = max(1, len(train_loader) // 50)
+        # log_every = max(1, len(train_loader) // 50)
 
         # ---- train + val -----------------------------------------
         t0 = time.time()
@@ -229,7 +242,7 @@ def main(no_plot: bool = False):
             model, train_loader, optimizer, scaler,
             epoch,
             plotter   = plotter,
-            log_every = 10,
+            log_every = 2000,
         )
         val_loss, val_acc = evaluate(model, val_loader)
         elapsed = time.time() - t0
