@@ -10,18 +10,16 @@ import numpy as np
 from tqdm import tqdm
 
 from torch.utils.data import Dataset, DataLoader
-
 from model import GPT, GPTConfig
 from utils.plots import LiveMetricsPlot
 
 
-
-# ======  Hyperparam & Config Loader ======
+# ====== Hyperparam Loader ======
 def load_config(path="config/train_config.yaml"):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-# ======  Custom Dataset for .bin files ======
+# ====== Dataset ======
 class TokenDataset(Dataset):
     def __init__(self, path, block_size):
         data = np.fromfile(path, dtype=np.uint16)
@@ -37,10 +35,13 @@ class TokenDataset(Dataset):
         y = chunk[1:]
         return x, y
 
-# ======  Train One Epoch ======
+# ====== Train One Epoch ======
 def train_one_epoch(model, dataloader, optimizer, device, epoch):
     model.train()
     total_loss = 0
+    correct = 0
+    total = 0
+
     pbar = tqdm(dataloader, desc=f"🚀 Epoch {epoch+1}", leave=False)
 
     for step, (x, y) in enumerate(pbar):
@@ -51,26 +52,45 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch):
         optimizer.step()
         total_loss += loss.item()
 
-        # update tqdm description every step
+        preds = logits.argmax(dim=-1)
+        correct += (preds == y).sum().item()
+        total += y.numel()
+
         pbar.set_postfix(loss=loss.item())
 
-    return total_loss / len(dataloader)
+    avg_loss = total_loss / len(dataloader)
+    train_acc = correct / total
+    return avg_loss, train_acc
 
-
-
-
-# ====== Eval Mode on Val Set ======
+# ====== Evaluate Mode ======
 def evaluate(model, dataloader, device):
     model.eval()
     total_loss = 0
+    correct = 0
+    total = 0
+
     with torch.no_grad():
         for x, y in dataloader:
             x, y = x.to(device), y.to(device)
-            _, loss = model(x, y)
+            logits, loss = model(x, y)
             total_loss += loss.item()
-    return total_loss / len(dataloader)
 
-# ====== Get Latest Checkpoint ======
+            preds = logits.argmax(dim=-1)
+            correct += (preds == y).sum().item()
+            total += y.numel()
+
+    avg_loss = total_loss / len(dataloader)
+    val_acc = correct / total
+    return avg_loss, val_acc
+
+# ====== Learning Rate Scheduler (Warmup + Cosine Decay) ======
+def get_lr(epoch, warmup=5, base_lr=3e-4, min_lr=1e-5, total_epochs=20):
+    if epoch < warmup:
+        return base_lr * (epoch + 1) / warmup
+    else:
+        return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * (epoch - warmup) / (total_epochs - warmup)))
+
+# ====== Latest Checkpoint Loader ======
 def get_latest_checkpoint():
     ckpt_files = glob.glob("checkpoints/gpt_epoch*.pt")
     if not ckpt_files:
@@ -80,34 +100,39 @@ def get_latest_checkpoint():
     epoch = int(os.path.splitext(os.path.basename(latest))[0].split("epoch")[-1])
     return latest, epoch
 
-# ====== Training Main ======
+# ====== Main ======
 def main():
     cfg = load_config()
+    cfg["learning_rate"] = float(cfg["learning_rate"])
+    cfg["weight_decay"] = float(cfg.get("weight_decay", 0.01))
+    cfg["min_lr"] = float(cfg.get("min_lr", 1e-5))
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # ============ Load Data ============
+
     train_dataset = TokenDataset("data/shakespeare/train.bin", cfg["block_size"])
     val_dataset = TokenDataset("data/shakespeare/val.bin", cfg["block_size"])
     train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"])
 
-    # ============ Init Model ============
     gpt_cfg = GPTConfig(
         block_size=cfg["block_size"],
         vocab_size=cfg["vocab_size"],
         n_layer=cfg["n_layer"],
         n_head=cfg["n_head"],
         n_embd=cfg["n_embd"],
-        dropout=cfg["dropout"]
+        dropout=cfg["dropout"],
     )
     model = GPT(gpt_cfg).to(device)
 
-    # ============ Optimizer ============
-    cfg["learning_rate"] = float(cfg["learning_rate"])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"])
-    best_val_loss = float("inf")  # Initialize to infinity for best checkpoint saving
+    # cfg["learning_rate"] = float(cfg["learning_rate"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg["learning_rate"],
+        weight_decay=cfg.get("weight_decay", 0.01),
+        betas=(0.9, 0.99)
+    )
 
-    # ========= Resume from Checkpoint =========
+    best_val_loss = float("inf")
     start_epoch = 0
     latest_ckpt, saved_epoch = get_latest_checkpoint()
     if latest_ckpt:
@@ -116,25 +141,36 @@ def main():
         start_epoch = saved_epoch
 
     plotter = LiveMetricsPlot()
-    # ============ Train Loop ============
+
     for epoch in range(start_epoch, cfg["epochs"]):
+        # LR scheduler
+        new_lr = get_lr(epoch, warmup=cfg.get("warmup_epochs", 5), base_lr=cfg["learning_rate"], min_lr=cfg.get("min_lr", 1e-5), total_epochs=cfg["epochs"])
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = new_lr
+        print(f"📉 LR adjusted to: {new_lr:.6f}")
+
         start = time.time()
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
-        val_loss = evaluate(model, val_loader, device)
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        val_loss, val_acc = evaluate(model, val_loader, device)
         end = time.time()
 
-        train_acc, val_acc = 0,0
+        train_perplexity = math.exp(train_loss)
+        val_perplexity = math.exp(val_loss)
+
         plotter.update(epoch, train_loss, val_loss, train_acc, val_acc)
 
         print("="*60)
         print(f"✅ Epoch {epoch+1}/{cfg['epochs']} completed!")
         print(f"📉 Avg Train Loss: {train_loss:.4f}")
         print(f"🧪 Val Loss     : {val_loss:.4f}")
+        print(f"📈 Train Perplexity: {train_perplexity:.2f}")
+        print(f"🧪 Val Perplexity  : {val_perplexity:.2f}")
+        print(f"✅ Train Accuracy: {train_acc*100:.2f}%")
+        print(f"🧪 Val Accuracy  : {val_acc*100:.2f}%")
         print(f"⏱️ Time taken   : {end-start:.2f} seconds")
         print("="*60)
 
-
-        # Save best checkpoint only
+        # Save best model checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             ckpt_dir = "checkpoints"
@@ -142,7 +178,6 @@ def main():
             ckpt_path = os.path.join(ckpt_dir, f"best_gpt_epoch{epoch+1}.pt")
             torch.save(model.state_dict(), ckpt_path)
             print(f"💾 Saved better model at {ckpt_path} (val_loss: {val_loss:.4f})")
-
 
 if __name__ == "__main__":
     main()
