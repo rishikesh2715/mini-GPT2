@@ -1,8 +1,8 @@
 # model.py
 
-import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
 
 # ---------------------------
@@ -43,7 +43,6 @@ class LayerNorm(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
         assert config.n_embd % config.n_head == 0, "Embedding dim must be divisible by number of heads"
 
 
@@ -57,24 +56,31 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
-        B, T, _ = x.size()  # Don't trust the input C after projection
-        C = self.n_head * self.head_dim
 
+    def forward(self, x):
+        B, T, _ = x.size()
+
+        # --- QKV projection ---------------------------------------------------
         q, k, v = self.c_attn(x).chunk(3, dim=-1)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
-        att = torch.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
+        # --- Flash / SDP -------------------------------------------------------
+        # dropout_p is automatically ignored in eval mode
+        y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,        # <- no mask tensor needed
+                dropout_p=self.attn_dropout.p,
+                is_causal=True)
 
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # y : (B, n_head, T, head_dim)  ->  (B, T, n_embd)
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+
+        # output projection + residual dropout
         y = self.resid_dropout(self.c_proj(y))
         return y
+
 
 
 
