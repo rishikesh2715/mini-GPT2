@@ -73,9 +73,10 @@ def test_train_one_epoch_and_evaluate(toy_loader):
     model = DummyModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
     device = torch.device("cpu")
+    epoch = 0
 
     # train should run without error and return a float
-    train_loss = train_one_epoch(model, toy_loader, optimizer, device)
+    train_loss = train_one_epoch(model, toy_loader, optimizer, device, epoch)
     assert isinstance(train_loss, float)
     assert train_loss >= 0
 
