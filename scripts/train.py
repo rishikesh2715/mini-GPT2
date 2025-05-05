@@ -1,284 +1,271 @@
-# scripts/train.py
-# ------------------------------------------------------------
-# Mini-GPT-2 training script with live plotting & performance
-# tweaks (AMP, fused AdamW, non-blocking H2D copies, torch.compile)
-# ------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+train.py — iterative‐based training for Mini‑GPT‑2 (no DDP),
+loading hyperparameters from train_config.yaml,
+with Weights & Biases logging for loss & perplexity.
+"""
+
 import os
+import sys
 import time
 import math
+import pickle
 import glob
+from contextlib import nullcontext
+
 import yaml
-import torch
 import numpy as np
-from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
-import argparse
+import torch
+from torch.amp import GradScaler
+import wandb
+from tqdm import trange
 
-from model         import GPT, GPTConfig
-from utils.plots   import LiveMetricsPlot
+from model import GPTConfig, GPT
 
-# ---- Perf flags ------------------------------------------------------------
+# -------- Performance Flags --------
 torch.backends.cudnn.benchmark = True        # fastest CUDNN kernels for static shapes
 torch.set_float32_matmul_precision("high")
-torch.backends.cuda.matmul.allow_tf32 = True
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# -----------------------------------------------------------------------------
+# Load hyperparameters from YAML
+# -----------------------------------------------------------------------------
+with open("config/train_config.yaml", "r") as f:
+    cfg = yaml.safe_load(f)
 
-# ============================================================================ #
-#                               Utility helpers                                #
-# ============================================================================ #
-def load_config(path: str = "config/train_config.yaml") -> dict:
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+# Cast numeric strings to floats if necessary
+learning_rate = float(cfg["learning_rate"])
+min_lr        = float(cfg["min_lr"])
+weight_decay  = float(cfg["weight_decay"])
 
+# Required params
+block_size      = int(cfg["block_size"])
+vocab_size      = int(cfg.get("vocab_size", 50304))
+n_layer         = int(cfg["n_layer"])
+n_head          = int(cfg["n_head"])
+n_embd          = int(cfg["n_embd"])
+dropout         = float(cfg["dropout"])
+batch_size      = int(cfg["batch_size"])
 
-class TokenDataset(Dataset):
-    """Memory-mapped dataset of uint16-encoded tokens."""
-    def __init__(self, path: str, block_size: int):
-        data = np.fromfile(path, dtype=np.uint16)
-        self.data       = torch.tensor(data, dtype=torch.long)
-        self.block_size = block_size
+# Iteration‐based scheduling params
+warmup_iters               = int(cfg.get("warmup_iters", cfg.get("warmup_epochs", 5)))
+max_iters                  = int(cfg.get("max_iters", 5000))
+lr_decay_iters             = max_iters
 
-    def __len__(self) -> int:
-        # keep this the same – it just tells DataLoader how many calls
-        # to __getitem__ to make per epoch
-        return len(self.data) - self.block_size
+# Fixed‑in‑script control params
+eval_interval              = int(cfg.get("eval_interval", 250))
+log_interval               = int(cfg.get("log_interval", 10))
+eval_iters                 = int(cfg.get("eval_iters", 200))
+always_save_checkpoint     = True
+gradient_accumulation_steps= int(cfg.get("grad_acc_steps", 1))
+grad_clip                  = float(cfg.get("grad_clip", 1.0))
+decay_lr                   = True
+init_from                  = 'scratch'
 
-    def __getitem__(self, _):
-        # <- NEW: ignore incoming index and pick a fresh start position
-        idx = torch.randint(
-            0,
-            len(self.data) - self.block_size - 1,
-            (1,)
-        ).item()
+# System settings
+device     = 'cuda' if torch.cuda.is_available() else 'cpu'
+dtype      = 'bfloat16' if (device.startswith('cuda') and torch.cuda.is_bf16_supported()) else 'float16'
+compile_flag = True
+out_dir    = 'out'
+# -----------------------------------------------------------------------------
 
-        chunk = self.data[idx : idx + self.block_size + 1]
-        x     = chunk[:-1]
-        y     = chunk[1:]
-        return x, y
-
-
-
-# ============================================================================ #
-#                             Training / Evaluation                            #
-# ============================================================================ #
-def train_one_epoch(model, dataloader, optimizer, scaler, epoch,
-                    plotter=None, log_every: int = 200):
-    """Train for a single epoch with mixed precision + live plotting."""
-    model.train()
-    total_loss = 0.0
-    correct    = 0
-    total      = 0
-
-    pbar = tqdm(dataloader, desc=f"🚀 Epoch {epoch + 1}", leave=False)
-
-    for step, (x, y) in enumerate(pbar, 1):
-        # non-blocking host→device copies (needs pin_memory=True in loader)
-        x = x.to(DEVICE, non_blocking=True)
-        y = y.to(DEVICE, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        # forward pass in FP16
-        with torch.autocast("cuda", dtype=torch.float16):
-            logits, loss = model(x, y)
-
-        # backward + optimizer step (scaled)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        # running stats
-        total_loss += loss.item()
-        preds       = logits.argmax(dim=-1)
-        correct    += (preds == y).sum().item()
-        total      += y.numel()
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-        # mini-batch live plot
-        if plotter and step % log_every == 0:
-            frac_epoch   = epoch + step / len(dataloader)
-            running_loss = total_loss / step
-            plotter.update(frac_epoch, running_loss, running_loss)
-
-    avg_loss  = total_loss / len(dataloader)
-    train_acc = correct / total
-    return avg_loss, train_acc
-
+def get_batch(split):
+    data_dir = os.path.join('data', 'shakespeare')
+    fname = 'train.bin' if split == 'train' else 'val.bin'
+    data = np.memmap(os.path.join(data_dir, fname), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
+    if device.startswith('cuda'):
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
 
 @torch.no_grad()
-def evaluate(model, dataloader):
-    """Validation loop with mixed precision."""
+def estimate_loss(model, ctx):
+    out = {}
     model.eval()
-    total_loss = 0.0
-    correct    = 0
-    total      = 0
+    for split in ('train', 'val'):
+        losses = torch.zeros(eval_iters, device=device)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            with ctx:
+                _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
 
-    for x, y in dataloader:
-        x = x.to(DEVICE, non_blocking=True)
-        y = y.to(DEVICE, non_blocking=True)
+def get_lr(it):
+    if it < warmup_iters:
+        return learning_rate * (it + 1) / (warmup_iters + 1)
+    if it > lr_decay_iters:
+        return min_lr
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
 
-        with torch.autocast("cuda", dtype=torch.float16):
-            logits, loss = model(x, y)
+def main():
+    os.makedirs(out_dir, exist_ok=True)
+    torch.manual_seed(1337)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-        total_loss += loss.item()
-        preds       = logits.argmax(dim=-1)
-        correct    += (preds == y).sum().item()
-        total      += y.numel()
-
-    return total_loss / len(dataloader), correct / total
-
-
-# cosine-decay LR with warm-up
-def lr_schedule(epoch, *, warmup=5, base_lr=3e-4, min_lr=1e-5, total_epochs=2):
-    if epoch < warmup:
-        return base_lr * (epoch + 1) / warmup
-    t = epoch - warmup
-    T = total_epochs - warmup
-    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * t / T))
-
-
-def latest_checkpoint():
-    ckpts = glob.glob("checkpoints/gpt_epoch*.pt")
-    if not ckpts:
-        return None, 0
-    ckpts.sort(key=os.path.getmtime)
-    path  = ckpts[-1]
-    epoch = int(os.path.splitext(os.path.basename(path))[0].split("epoch")[-1])
-    return path, epoch
-
-
-# ============================================================================ #
-#                                      Main                                    #
-# ============================================================================ #
-def main(no_plot: bool = False):
-    cfg = load_config()
-    cfg["learning_rate"] = float(cfg["learning_rate"])
-    cfg["weight_decay"]  = float(cfg.get("weight_decay", 0.01))
-    cfg["min_lr"]        = float(cfg.get("min_lr", 1e-5))
-
-    # ------------------- Data -------------------
-    train_ds = TokenDataset("data/shakespeare/train.bin", cfg["block_size"])
-    val_ds   = TokenDataset("data/shakespeare/val.bin",   cfg["block_size"])
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size  = cfg["batch_size"],
-        shuffle     = True,
-        num_workers = 8,          # tune for CPU
-        pin_memory  = True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size  = cfg["batch_size"],
-        num_workers = 4,
-        pin_memory  = True,
+    # W&B init
+    wandb.init(
+        project="mini-gpt2-pretraining",
+        config=cfg,
+        save_code=True,
     )
 
-    # ------------------- Model -------------------
-    gpt_cfg = GPTConfig(
-        block_size = cfg["block_size"],
-        vocab_size = cfg["vocab_size"],
-        n_layer    = cfg["n_layer"],
-        n_head     = cfg["n_head"],
-        n_embd     = cfg["n_embd"],
-        dropout    = cfg["dropout"],
-    )
-    model = GPT(gpt_cfg).to(DEVICE)
+    device_type = 'cuda' if device.startswith('cuda') else 'cpu'
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-    # optional Graph-capture speed-up (PyTorch 2+)
-    if (
-        torch.__version__ >= "2.0.0"
-        and DEVICE.type == "cuda"
-        and os.name == "nt"
-    ):
+    # Model init
+    model_args = dict(
+        n_layer    = n_layer,
+        n_head     = n_head,
+        n_embd     = n_embd,
+        block_size = block_size,
+        bias       = True,
+        vocab_size = vocab_size,
+        dropout    = dropout,
+    )
+    meta_path = os.path.join('data', 'shakespeare', 'meta.pkl')
+    if os.path.exists(meta_path):
+        meta = pickle.load(open(meta_path, 'rb'))
+        model_args['vocab_size'] = meta.get('vocab_size', vocab_size)
+
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf).to(device)
+
+    if compile_flag and hasattr(torch, 'compile'):
+        print("Compiling model…")
         model = torch.compile(model)
 
-    # ------------------- Optimizer / AMP -----------
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr           = cfg["learning_rate"],
-        weight_decay = cfg["weight_decay"],
-        betas        = (0.9, 0.95),
-        foreach      = True,          # fused CUDA kernel in PyTorch 2.x
+        lr           = learning_rate,
+        betas        = (0.9, 0.99),
+        weight_decay = weight_decay,
+        foreach      = True,
     )
-    scaler = torch.amp.GradScaler()
+    scaler = GradScaler(enabled=(dtype == 'float16'))
 
-    # ------------------- Resume (optional) ---------
-    best_val_loss = float("inf")
-    start_epoch   = 0
-    ckpt_path, start_epoch = latest_checkpoint()
-    if ckpt_path:
-        print(f"⚡ Resuming from {ckpt_path}")
-        model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    iter_num      = 0
+    best_val_loss = float('inf')
+    t0 = time.time()
+    print(f"Training on {device} | tokens/iter={batch_size * block_size:,}")
 
-    # ------------------- Live plot -----------------
-    plotter = None if no_plot else LiveMetricsPlot()
-
-    # ------------------- Training loop -------------
-    print(f"Device: {DEVICE} | CUDA: {torch.version.cuda} | Torch: {torch.__version__}")
-    if DEVICE.type == "cuda":
-        print("GPU:", torch.cuda.get_device_name(0))
-
-    for epoch in range(start_epoch, cfg["epochs"]):
-        # adjust LR
-        lr = lr_schedule(
-            epoch,
-            warmup        = cfg.get("warmup_epochs", 5),
-            base_lr       = cfg["learning_rate"],
-            min_lr        = cfg["min_lr"],
-            total_epochs  = cfg["epochs"],
-        )
+    pbar = trange(iter_num, max_iters, desc="Training", dynamic_ncols=True)
+    for iter_num in pbar:
+        # LR update
+        lr = get_lr(iter_num) if decay_lr else learning_rate
         for pg in optimizer.param_groups:
-            pg["lr"] = lr
-        print(f"📉 LR → {lr:.2e}")
+            pg['lr'] = lr
 
-        # pick ~50 points per epoch for plotting
-        # log_every = max(1, len(train_loader) // 50)
+        # Gradient accumulation
+        X, Y = get_batch('train')
+        for _ in range(gradient_accumulation_steps):
+            with ctx:
+                logits, loss = model(X, Y)
+                loss = loss / gradient_accumulation_steps
+            X, Y = get_batch('train')
+            scaler.scale(loss).backward()
 
-        # ---- train + val -----------------------------------------
-        t0 = time.time()
-        tr_loss, tr_acc = train_one_epoch(
-            model, train_loader, optimizer, scaler,
-            epoch,
-            plotter   = plotter,
-            log_every = 2000,
-        )
-        val_loss, val_acc = evaluate(model, val_loader)
-        elapsed = time.time() - t0
+        if grad_clip > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
-        # epoch-level plot update
-        if plotter:
-            plotter.update(epoch + 1, tr_loss, val_loss, tr_acc, val_acc)
+        # Logging every log_interval
+        if iter_num % log_interval == 0:
+            lossf = loss.detach().item() * gradient_accumulation_steps
+            dt = (time.time() - t0) * 1000
+            pbar.set_postfix({
+                "loss": f"{lossf:.4f}",
+                "lr": f"{lr:.2e}",
+                "dt": f"{dt:.0f}ms"
+            })
+            wandb.log({
+                "iter": iter_num,
+                "train/loss_step": lossf,
+                "lr": lr,
+            })
+            t0 = time.time()
 
-        # ---- console log ----------------------------------------
-        tr_ppl  = math.exp(tr_loss)
-        val_ppl = math.exp(val_loss)
-        print("=" * 65)
-        print(f"✓ Epoch {epoch+1}/{cfg['epochs']}  "
-              f"Train loss {tr_loss:.4f}  |  Val loss {val_loss:.4f}")
-        print(f"  Train ppl {tr_ppl:8.2f} | Val ppl {val_ppl:8.2f}")
-        print(f"  Acc: train {tr_acc*100:5.2f}% | val {val_acc*100:5.2f}%")
-        print(f"  ⏱  {elapsed:.1f}s")
-        print("=" * 65)
+        # Eval & W&B logging
+        if iter_num % eval_interval == 0:
+            losses = estimate_loss(model, ctx)
+            train_loss = losses['train']
+            val_loss   = losses['val']
+            train_ppl  = math.exp(train_loss)
+            val_ppl    = math.exp(val_loss)
 
-        # save best ckpt
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            os.makedirs("checkpoints", exist_ok=True)
-            save_path = f"checkpoints/best_gpt_epoch{epoch+1}.pt"
-            torch.save(model.state_dict(), save_path)
-            print(f"💾 Saved new best model → {save_path}")
+            print(f"\nstep {iter_num}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+            wandb.log({
+                "iter":        iter_num,
+                "train/loss":  train_loss,
+                "val/loss":    val_loss,
+                "train/ppl":   train_ppl,
+                "val/ppl":     val_ppl,
+                "lr":          lr,
+            })
 
-    # end for epoch
+            if val_loss < best_val_loss or always_save_checkpoint:
+                best_val_loss = val_loss
+                ckpt = {
+                    'model_args':   model_args,
+                    'model':        model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict(),
+                    'optimizer':    optimizer.state_dict(),
+                    'iter_num':     iter_num,
+                    'best_val_loss': best_val_loss,
+                }
+                ckpt_path = os.path.join(out_dir, f'ckpt_{iter_num}.pt')
+                torch.save(ckpt, ckpt_path)
+                print(f"Saved checkpoint → {ckpt_path}")
+
     print("🎉 Training complete.")
+    # === Save final model weights-only checkpoint for inference ===
+    weights_path = os.path.join(out_dir, f"model_weights_{iter_num}.pt")
+    final_weights = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+    torch.save(final_weights, weights_path)
+    print(f"✅ Saved weights-only checkpoint → {weights_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--no_plot", action="store_true",
-        help="Disable live Matplotlib window (still logs CSV)."
-    )
-    args = parser.parse_args()
-    main(no_plot=args.no_plot)
+
+    if "--resave_weights" in sys.argv:
+        # Automatically get latest checkpoint if you want
+        ckpt_files = sorted(glob.glob(os.path.join(out_dir, "ckpt_*.pt")))
+        if not ckpt_files:
+            raise FileNotFoundError("❌ No checkpoint files found in 'out/'")
+        path = ckpt_files[-1]  # or replace with fixed path like "ckpt_1750.pt"
+
+        print(f"🔁 Loading checkpoint → {path}")
+        ckpt = torch.load(path, map_location=device)
+
+        # Rebuild model
+        model_args = ckpt["model_args"]
+        config = GPTConfig(**model_args)
+        model = GPT(config).to(device)
+
+        # Safely fix keys from compiled model
+        raw_sd = ckpt["model"]
+        if any(k.startswith("_orig_mod.") for k in raw_sd.keys()):
+            raw_sd = {k.replace("_orig_mod.", ""): v for k, v in raw_sd.items()}
+        model.load_state_dict(raw_sd)
+
+        # Save clean weights
+        weights_path = os.path.join(out_dir, "model_weights.pt")
+        torch.save(model.state_dict(), weights_path)
+        print(f"✅ Resaved model weights-only to {weights_path}")
+        sys.exit()
+
+    main()
+
