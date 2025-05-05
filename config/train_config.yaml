@@ -1,19 +1,28 @@
 # config/train_config.yaml
 
+# === Model Config ===
 block_size: 128
 vocab_size: 50304
-
-n_layer: 4
-n_head: 4
-n_embd: 256
+n_layer: 6
+n_head: 6
+n_embd: 384
 dropout: 0.3
 
+# === Optimization ===
 batch_size: 64
+learning_rate: 1e-3
+min_lr: 1e-4
+weight_decay: 0.1
+plateau_start: 1             # used in original train.py if you still use plateau LR
+grad_clip: 1.0               # gradient clipping norm
+grad_acc_steps: 1            # accumulation steps (helps simulate larger batch)
 
-learning_rate: 3e-4
-min_lr: 5e-5
-weight_decay: 1e-3
+# === Training Loop ===
+max_iters: 5000             # total number of training steps
+log_interval: 10             # log training metrics every N steps
+eval_interval: 250           # evaluate model every N steps
+eval_iters: 200              # batches used per evaluation cycle
 
-warmup_epochs: 2
-epochs: 20
-
+# === Checkpointing / Misc ===
+always_save_checkpoint: true
+early_stopping_patience: 10  # not used yet, placeholder for future
