@@ -12,13 +12,23 @@ class LiveMetricsPlot:
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
+        self.train_pplx = []
+        self.val_pplx = []
 
         # CSV Logging Setup
         self.log_path = save_log_path
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         with open(self.log_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss", "val_loss", "train_acc", "val_acc"])
+            writer.writerow(
+                ["epoch", 
+                 "train_loss", 
+                 "val_loss", 
+                 "train_acc", 
+                 "val_acc", 
+                 "train_ppl", 
+                 "val_ppl"]
+                 )
 
         # Plot setup
         plt.style.use("dark_background")
@@ -51,11 +61,15 @@ class LiveMetricsPlot:
         self.ax3.set_ylabel("Perplexity")
         self.ax4.set_ylabel("Perplexity")
 
-    def update(self, epoch, train_loss, val_loss, train_acc=None, val_acc=None):
+    def update(self, epoch, train_loss, val_loss, train_acc=None, val_acc=None, train_ppl=None, val_ppl=None):
+
         self.train_losses.append(train_loss)
         self.val_losses.append(val_loss)
-        self.train_accs.append(train_acc if train_acc is not None else 0)
-        self.val_accs.append(val_acc if val_acc is not None else 0)
+        self.train_accs.append(train_acc)
+        self.val_accs.append(val_acc)
+        self.train_pplx.append(train_ppl)
+        self.val_pplx.append(val_ppl)
+
 
         # X range
         x = range(1, len(self.train_losses) + 1)
@@ -65,10 +79,10 @@ class LiveMetricsPlot:
         self.loss_line_val.set_data(x, self.val_losses)
 
         # update perplexity
-        train_pplx = [math.exp(l) for l in self.train_losses]
-        val_pplx = [math.exp(l) for l in self.val_losses]
-        self.pplx_line_train.set_data(x, train_pplx)
-        self.pplx_line_val.set_data(x, val_pplx)
+        # train_pplx = [math.exp(l) for l in self.train_losses]
+        # val_pplx = [math.exp(l) for l in self.val_losses]
+        self.pplx_line_train.set_data(x,self.train_pplx)
+        self.pplx_line_val.set_data(x, self.val_pplx)
 
         # 🛠 Fix for matplotlib jank at first epoch
         if len(self.train_losses) == 1:
@@ -89,7 +103,8 @@ class LiveMetricsPlot:
         # Log to CSV
         with open(self.log_path, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([epoch + 1, train_loss, val_loss, self.train_accs[-1], self.val_accs[-1]])
+            writer.writerow([epoch + 1, train_loss, val_loss, train_acc, val_acc, train_ppl, val_ppl])
+
 
     def save(self, path="results/metrics_plot.png"):
         plt.ioff()
