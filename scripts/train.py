@@ -29,8 +29,12 @@ torch.set_float32_matmul_precision("high")
 # -----------------------------------------------------------------------------
 # Load hyperparameters from YAML
 # -----------------------------------------------------------------------------
-with open("config/train_config.yaml", "r") as f:
-    cfg = yaml.safe_load(f)
+def load_config(path: str) -> dict:
+    """Load a YAML configuration file and return it as a dict."""
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+cfg = load_config("config/train_config.yaml")
 
 # Cast numeric strings to floats if necessary
 learning_rate = float(cfg["learning_rate"])
@@ -67,6 +71,48 @@ dtype      = 'bfloat16' if (device.startswith('cuda') and torch.cuda.is_bf16_sup
 compile_flag = True
 out_dir    = 'out'
 # -----------------------------------------------------------------------------
+
+class TokenDataset(torch.utils.data.Dataset):
+    """Simple dataset loading a contiguous sequence of token IDs from a .bin file."""
+
+    def __init__(self, path: str, block_size: int):
+        self.data = np.memmap(path, dtype=np.uint16, mode='r')
+        self.block_size = block_size
+
+    def __len__(self) -> int:
+        return len(self.data) - self.block_size
+
+    def __getitem__(self, idx: int):
+        x = torch.from_numpy(self.data[idx:idx + self.block_size].astype(np.int64))
+        y = torch.from_numpy(self.data[idx + 1:idx + 1 + self.block_size].astype(np.int64))
+        return x, y
+
+def train_one_epoch(model: torch.nn.Module, loader, optimizer, device: torch.device, epoch: int) -> float:
+    """Run one training epoch and return the average loss."""
+    model.train()
+    total_loss = 0.0
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        optimizer.zero_grad()
+        _, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def evaluate(model: torch.nn.Module, loader, device: torch.device) -> float:
+    """Evaluate the model on a dataset loader and return the average loss."""
+    model.eval()
+    total_loss = 0.0
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        _, loss = model(x, y)
+        total_loss += loss.item()
+    return total_loss / len(loader)
 
 def get_batch(split):
     data_dir = os.path.join('data', 'shakespeare')
